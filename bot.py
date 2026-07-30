@@ -1,20 +1,6 @@
 """
 Yo'l bo'limi boshliqlarini attestatsiya - Telegram Quiz Bot
 =============================================================
-271 ta savolni tasodifiy tartibda so'raydi, foydalanuvchi variant
-tanlaydi (tugmalar orqali), agar javoblar.json faylida to'g'ri javob
-belgilangan bo'lsa - to'g'ri/noto'g'ri ko'rsatadi va ballni sanaydi.
-Javob kalitida bo'lmagan savollar uchun faqat tanlangan variant
-saqlanadi (baholash keyinroq, kalit to'ldirilgach amalga oshiriladi).
-
-O'RNATISH:
-    pip install python-telegram-bot==21.6
-
-ISHGA TUSHIRISH:
-    1. Telegram'da @BotFather ga yozib, /newbot orqali token oling
-    2. Terminalda: export BOT_TOKEN="sizning_tokeningiz"
-       (yoki quyida TOKEN o'zgaruvchisiga to'g'ridan-to'g'ri yozing)
-    3. python bot.py
 """
 
 import json
@@ -43,18 +29,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 QUESTIONS_PATH = os.path.join(BASE_DIR, "questions.json")
 ANSWERS_PATH = os.path.join(BASE_DIR, "answers.json")
 
-TOKEN = os.environ.get("BOT_TOKEN", "8770486748:AAFWzy2Iy5RJcPfC6APmImP-zL4LAoTCXso")
+TOKEN = os.environ.get("BOT_TOKEN")
 
 with open(QUESTIONS_PATH, encoding="utf-8") as f:
-    QUESTIONS = json.load(f)  # {"1": {"q":..., "a":..., "b":..., "v":..., "g":...}, ...}
+    QUESTIONS = json.load(f)
 
 with open(ANSWERS_PATH, encoding="utf-8") as f:
-    ANSWERS = json.load(f)  # {"1": "v" yoki None, ...}
+    ANSWERS = json.load(f)
 
 LETTERS = ["a", "b", "v", "g"]
 LETTER_LABEL = {"a": "А", "b": "Б", "v": "В", "g": "Г"}
 
-# har bir foydalanuvchi uchun sessiya holati (xotirada saqlanadi)
 user_sessions = {}
 
 
@@ -85,7 +70,6 @@ def build_keyboard(qid: str) -> InlineKeyboardMarkup:
 async def send_question(chat_id, context: ContextTypes.DEFAULT_TYPE, user_id):
     session = user_sessions[user_id]
     if session["idx"] >= len(session["order"]):
-        # test tugadi
         total = session["answered"]
         correct = session["correct"]
         unknown = session["unknown"]
@@ -172,8 +156,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if TOKEN == "SIZNING_TOKENINGIZ_BU_YERGA":
-        print("XATOLIK: Avval BOT_TOKEN ni sozlang (yuqoridagi izohga qarang).")
+    if not TOKEN:
+        print("XATOLIK: BOT_TOKEN muhit o'zgaruvchisi topilmadi.")
         return
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
