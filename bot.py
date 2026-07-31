@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 QUESTIONS_PATH = os.path.join(BASE_DIR, "questions.json")
 ANSWERS_PATH = os.path.join(BASE_DIR, "answers.json")
+STATS_DIR = os.environ.get("STATS_DIR", BASE_DIR)
+STATS_PATH = os.path.join(STATS_DIR, "user_stats.json")
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -202,6 +204,84 @@ games = {}
 question_history = {}  # (chat_id, idx) -> batafsil taqsimot matni
 
 
+def load_stats():
+    if os.path.exists(STATS_PATH):
+        try:
+            with open(STATS_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_stats(stats):
+    try:
+        with open(STATS_PATH, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+USER_STATS = load_stats()
+
+
+def record_result(user_id: int, name: str, percent: int):
+    key = str(user_id)
+    entry = USER_STATS.setdefault(key, {"name": name, "history": []})
+    entry["name"] = name
+    entry["history"].append(percent)
+    save_stats(USER_STATS)
+
+
+def build_analysis_text(user_id: int) -> str:
+    key = str(user_id)
+    entry = USER_STATS.get(key)
+    if not entry or not entry["history"]:
+        return "Siz hali birorta ham musobaqada qatnashmagansiz. Guruhda /start bilan boshlang!"
+
+    history = entry["history"]
+    n = len(history)
+    first, last = history[0], history[-1]
+    avg = sum(history) / n
+
+    lines = [
+        f"📈 Sizning tahliliz:",
+        f"Jami qatnashgan safaringiz: {n} ta",
+        f"Birinchi natijangiz: {first}%",
+        f"Oxirgi natijangiz: {last}%",
+        f"O'rtacha natija: {round(avg)}%",
+    ]
+
+    if n >= 2:
+        growth_per_session = (last - first) / (n - 1)
+        if growth_per_session > 0:
+            remaining_pct = 100 - last
+            more_sessions = remaining_pct / growth_per_session
+            more_sessions = max(0, round(more_sessions))
+            lines.append(f"O'sish sur'atingiz: safar boshiga ~{round(growth_per_session, 1)}%")
+            if more_sessions == 0:
+                lines.append("🏆 Siz allaqachon 100% natijaga erishgansiz yoki juda yaqinsiz!")
+            else:
+                lines.append(
+                    f"Shu sur'atda yana taxminan {more_sessions} marta qatnashsangiz, "
+                    f"~100% natijaga erishishingiz mumkin."
+                )
+        elif growth_per_session == 0:
+            lines.append("Natijangiz barqaror — o'sish yoki pasayish kuzatilmayapti.")
+        else:
+            lines.append("So'nggi natijalaringiz pasayish tendensiyasida — ko'proq mashq qiling!")
+    else:
+        lines.append("Tendensiyani ko'rish uchun yana kamida 1 marta qatnashing.")
+
+    return "\n".join(lines)
+
+
+async def tahlil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = build_analysis_text(update.effective_user.id)
+    await update.message.reply_text(text)
+
+
+
 def new_game_state():
     return {
         "phase": "lobby",  # lobby -> running -> finished
@@ -251,52 +331,15 @@ async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     games[chat_id] = new_game_state()
     kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Qatnashaman", callback_data=f"join:{chat_id}")],
-            [InlineKeyboardButton("🎮 Boshlash", callback_data=f"gostart:{chat_id}")],
-        ]
+        [[InlineKeyboardButton("🎮 Boshlash", callback_data=f"gostart:{chat_id}")]]
     )
     await update.message.reply_text(
         f"🏁 Attestatsiya musobaqasi!\n\n"
-        f"Boshlash uchun kamida 1 kishi \"Qatnashaman\" tugmasini bosishi kerak.\n"
+        f"Boshlash uchun \"Boshlash\" tugmasini bosing.\n"
         f"Har savolga {QUESTION_TIME_SECONDS} soniya vaqt beriladi, jami "
-        f"{QUESTIONS_PER_GAME} ta savol bo'ladi.\n\n"
-        f"Hozircha qatnashchilar: 0",
-        reply_markup=kb,
-    )
-
-
-async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    _, chat_id_str = query.data.split(":")
-    chat_id = int(chat_id_str)
-    game = games.get(chat_id)
-
-    if not game or game["phase"] != "lobby":
-        await query.answer("Bu musobaqa allaqachon boshlangan yoki tugagan.", show_alert=True)
-        return
-
-    user = query.from_user
-    if user.id in game["joined"]:
-        await query.answer("Siz allaqachon ro'yxatdasiz.")
-        return
-
-    game["joined"][user.id] = display_name(user)
-    await query.answer("Ro'yxatdan o'tdingiz!")
-
-    names_list = "\n".join(f"• {n}" for n in game["joined"].values())
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Qatnashaman", callback_data=f"join:{chat_id}")],
-            [InlineKeyboardButton("🎮 Boshlash", callback_data=f"gostart:{chat_id}")],
-        ]
-    )
-    await query.edit_message_text(
-        f"🏁 Attestatsiya musobaqasi!\n\n"
-        f"Boshlash uchun kamida 1 kishi \"Qatnashaman\" tugmasini bosishi kerak.\n"
-        f"Har savolga {QUESTION_TIME_SECONDS} soniya vaqt beriladi, jami "
-        f"{QUESTIONS_PER_GAME} ta savol bo'ladi.\n\n"
-        f"Qatnashchilar ({len(game['joined'])}):\n{names_list}",
+        f"{QUESTIONS_PER_GAME} ta savol bo'ladi.\n"
+        f"Test davomida istalgan vaqtda yangi odam qo'shilishi mumkin — "
+        f"variantni tanlashning o'zi yetarli.",
         reply_markup=kb,
     )
 
@@ -311,26 +354,17 @@ async def handle_gostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Bu musobaqa allaqachon boshlangan yoki tugagan.", show_alert=True)
         return
 
-    if len(game["joined"]) < 1:
-        await query.answer(
-            "Boshlash uchun kamida 1 kishi \"Qatnashaman\" tugmasini bosishi kerak.",
-            show_alert=True,
-        )
-        return
-
-    if query.from_user.id not in game["joined"]:
-        await query.answer("Faqat ro'yxatdan o'tgan qatnashchilar boshlay oladi.", show_alert=True)
-        return
-
     await query.answer("Boshlanmoqda!")
     game["phase"] = "running"
     game["order"] = pick_questions(QUESTIONS_PER_GAME)
-    game["scores"] = {uid: 0 for uid in game["joined"]}
     game["idx"] = 0
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"🚀 Musobaqa boshlandi! {len(game['order'])} ta savol, omad!",
+        text=(
+            f"🚀 Musobaqa boshlandi! {len(game['order'])} ta savol, omad!\n"
+            f"Istalgan vaqtda variant tanlab, o'yinga qo'shilishingiz mumkin."
+        ),
     )
     await group_send_question(chat_id, context)
 
@@ -498,10 +532,6 @@ async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Bu test hozir pauzada emas.", show_alert=True)
         return
 
-    if query.from_user.id not in game["joined"]:
-        await query.answer("Faqat ro'yxatdan o'tgan qatnashchilar davom ettira oladi.", show_alert=True)
-        return
-
     await query.answer("Davom etmoqda!")
     game["phase"] = "running"
     game["no_answer_streak"] = 0
@@ -525,6 +555,7 @@ async def finish_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
     game = games[chat_id]
     game["phase"] = "finished"
     ranked = sorted(game["scores"].items(), key=lambda x: x[1], reverse=True)
+    total_q = len(game["order"]) or 1
 
     lines = ["🏆 Musobaqa yakunlandi! Yakuniy natijalar:\n"]
     for i, (uid, score) in enumerate(ranked, start=1):
@@ -534,8 +565,11 @@ async def finish_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{title}: {name} — {score} ball")
         else:
             lines.append(f"{i}. {name} — {score} ball")
+        percent = round(100 * score / total_q)
+        record_result(uid, name, percent)
 
-    lines.append("\nYangi musobaqa uchun /start ni qayta bosing.")
+    lines.append("\nShaxsiy tahlilingizni ko'rish uchun botga shaxsiy chatda /tahlil yozing.")
+    lines.append("Yangi musobaqa uchun /start ni qayta bosing.")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
     del games[chat_id]
 
@@ -552,8 +586,8 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user = query.from_user
     if user.id not in game["joined"]:
-        await query.answer("Siz bu musobaqada qatnashmagansiz.", show_alert=True)
-        return
+        game["joined"][user.id] = display_name(user)
+        game["scores"].setdefault(user.id, 0)
 
     if user.id in game["answered_this_q"]:
         await query.answer("Siz bu savolga allaqachon javob berdingiz.")
@@ -634,8 +668,8 @@ def main():
     app.add_handler(CommandHandler("start", musobaqa_start))
     app.add_handler(CommandHandler("musobaqa", musobaqa_start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("tahlil", tahlil))
 
-    app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join:"))
     app.add_handler(CallbackQueryHandler(handle_gostart, pattern=r"^gostart:"))
     app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(solo_handle_answer, pattern=r"^solo:"))
