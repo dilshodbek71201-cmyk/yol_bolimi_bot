@@ -199,6 +199,7 @@ async def solo_handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # MUSOBAQA REJIMI (guruh) - xotira: chat_id -> game state
 # ---------------------------------------------------------------------
 games = {}
+question_history = {}  # (chat_id, idx) -> batafsil taqsimot matni
 
 
 def new_game_state():
@@ -215,6 +216,7 @@ def new_game_state():
         "answer_order": [],  # ismlar, javob bergan tartibda
         "first_correct": None,  # birinchi to'g'ri javob topgan ism
         "choices_this_q": {},  # letter -> [ismlar]
+        "no_answer_streak": 0,  # ketma-ket hech kim javob bermagan savollar soni
     }
 
 
@@ -256,7 +258,7 @@ async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         f"🏁 Attestatsiya musobaqasi!\n\n"
-        f"Boshlash uchun kamida 2 kishi \"Qatnashaman\" tugmasini bosishi kerak.\n"
+        f"Boshlash uchun kamida 1 kishi \"Qatnashaman\" tugmasini bosishi kerak.\n"
         f"Har savolga {QUESTION_TIME_SECONDS} soniya vaqt beriladi, jami "
         f"{QUESTIONS_PER_GAME} ta savol bo'ladi.\n\n"
         f"Hozircha qatnashchilar: 0",
@@ -291,7 +293,7 @@ async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await query.edit_message_text(
         f"🏁 Attestatsiya musobaqasi!\n\n"
-        f"Boshlash uchun kamida 2 kishi \"Qatnashaman\" tugmasini bosishi kerak.\n"
+        f"Boshlash uchun kamida 1 kishi \"Qatnashaman\" tugmasini bosishi kerak.\n"
         f"Har savolga {QUESTION_TIME_SECONDS} soniya vaqt beriladi, jami "
         f"{QUESTIONS_PER_GAME} ta savol bo'ladi.\n\n"
         f"Qatnashchilar ({len(game['joined'])}):\n{names_list}",
@@ -309,9 +311,9 @@ async def handle_gostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Bu musobaqa allaqachon boshlangan yoki tugagan.", show_alert=True)
         return
 
-    if len(game["joined"]) < 2:
+    if len(game["joined"]) < 1:
         await query.answer(
-            "Boshlash uchun kamida 2 kishi \"Qatnashaman\" tugmasini bosishi kerak.",
+            "Boshlash uchun kamida 1 kishi \"Qatnashaman\" tugmasini bosishi kerak.",
             show_alert=True,
         )
         return
@@ -340,14 +342,17 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
     game["answer_order"] = []
     game["first_correct"] = None
     game["choices_this_q"] = {}
+    game["seconds_left"] = QUESTION_TIME_SECONDS
 
     qid = game["order"][game["idx"]]
-    base_text = build_question_text(
+    stem_text = build_question_text(
         qid, prefix=f"[{game['idx'] + 1}/{len(game['order'])}] "
-    ) + f"\n\n⏱ {QUESTION_TIME_SECONDS} soniya"
-    game["question_base_text"] = base_text
+    )
+    game["question_stem_text"] = stem_text
     kb = build_keyboard(qid, "g")
-    msg = await context.bot.send_message(chat_id=chat_id, text=base_text, reply_markup=kb)
+    msg = await context.bot.send_message(
+        chat_id=chat_id, text=build_live_text(game), reply_markup=kb
+    )
     game["question_message_id"] = msg.message_id
 
     context.job_queue.run_once(
@@ -357,6 +362,53 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
         data={"idx": game["idx"]},
         name=f"timeout_{chat_id}_{game['idx']}",
     )
+    context.job_queue.run_repeating(
+        countdown_tick,
+        interval=1,
+        first=1,
+        chat_id=chat_id,
+        data={"idx": game["idx"]},
+        name=f"countdown_{chat_id}_{game['idx']}",
+    )
+
+
+def build_live_text(game) -> str:
+    timer_icon = "🔴" if game["seconds_left"] <= 10 else "⏱"
+    text = f"{game['question_stem_text']}\n\n{timer_icon} {game['seconds_left']} soniya"
+    if game["answer_order"]:
+        answered_list = "\n".join(f"• {n}" for n in game["answer_order"])
+        text += (
+            f"\n\n👥 Javob berganlar ({len(game['answer_order'])}/{len(game['joined'])}):\n"
+            f"{answered_list}"
+        )
+    return text
+
+
+async def countdown_tick(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    idx = job.data["idx"]
+    game = games.get(chat_id)
+
+    if not game or game["idx"] != idx or game["question_closed"]:
+        job.schedule_removal()
+        return
+
+    game["seconds_left"] = max(0, game["seconds_left"] - 1)
+
+    qid = game["order"][idx]
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=game["question_message_id"],
+            text=build_live_text(game),
+            reply_markup=build_keyboard(qid, "g"),
+        )
+    except Exception:
+        pass
+
+    if game["seconds_left"] <= 0:
+        job.schedule_removal()
 
 
 async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
@@ -389,31 +441,81 @@ async def finalize_question(chat_id, idx, context: ContextTypes.DEFAULT_TYPE):
 
     total_joined = len(game["joined"]) or 1
     breakdown_lines = ["\n📊 Javoblar taqsimoti:"]
+    detail_lines = []
     for letter in LETTERS:
         if not q.get(letter):
             continue
         names = game["choices_this_q"].get(letter, [])
         pct = round(100 * len(names) / total_joined)
         mark = " ✅" if letter == correct_letter else ""
+        breakdown_lines.append(f"{LETTER_LABEL[letter]}){mark} {pct}%")
         names_str = ", ".join(names) if names else "—"
-        breakdown_lines.append(
-            f"{LETTER_LABEL[letter]}){mark} {pct}% ({len(names)}): {names_str}"
-        )
+        detail_lines.append(f"{LETTER_LABEL[letter]}){mark} {pct}% ({len(names)}): {names_str}")
     not_answered = [
         n for uid, n in game["joined"].items() if n not in game["answer_order"]
     ]
     if not_answered:
-        breakdown_lines.append(f"Javob bermaganlar: {', '.join(not_answered)}")
+        detail_lines.append(f"Javob bermaganlar: {', '.join(not_answered)}")
     reveal += "\n" + "\n".join(breakdown_lines)
 
+    question_history[(chat_id, idx)] = "\n".join(detail_lines)
+
+    if len(game["answered_this_q"]) == 0:
+        game["no_answer_streak"] += 1
+    else:
+        game["no_answer_streak"] = 0
+
     scoreboard = build_scoreboard(game)
-    await context.bot.send_message(chat_id=chat_id, text=f"{reveal}\n\n{scoreboard}")
+    votes_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("👁 Ovozlarni ko'rish", callback_data=f"showvotes:{chat_id}:{idx}")]]
+    )
+    await context.bot.send_message(
+        chat_id=chat_id, text=f"{reveal}\n\n{scoreboard}", reply_markup=votes_kb
+    )
 
     game["idx"] += 1
+
     if game["idx"] >= len(game["order"]):
         await finish_game(chat_id, context)
-    else:
-        await group_send_question(chat_id, context)
+        return
+
+    if game["no_answer_streak"] >= 2:
+        game["phase"] = "paused"
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("▶️ Testni davom ettirish", callback_data=f"resume:{chat_id}")]]
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏸ Ketma-ket 2 ta savolga hech kim javob bermadi. Test pauza qilindi.",
+            reply_markup=kb,
+        )
+        return
+
+    await group_send_question(chat_id, context)
+
+
+async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, chat_id_str = query.data.split(":")
+    chat_id = int(chat_id_str)
+    game = games.get(chat_id)
+
+    if not game or game["phase"] != "paused":
+        await query.answer("Bu test hozir pauzada emas.", show_alert=True)
+        return
+
+    if query.from_user.id not in game["joined"]:
+        await query.answer("Faqat ro'yxatdan o'tgan qatnashchilar davom ettira oladi.", show_alert=True)
+        return
+
+    await query.answer("Davom etmoqda!")
+    game["phase"] = "running"
+    game["no_answer_streak"] = 0
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await group_send_question(chat_id, context)
 
 
 def build_scoreboard(game) -> str:
@@ -484,16 +586,11 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     game["choices_this_q"].setdefault(chosen, []).append(name)
 
     # savol xabarini "javob berganlar" ro'yxati bilan jonli yangilaymiz
-    answered_list = "\n".join(f"• {n}" for n in game["answer_order"])
-    live_text = (
-        f"{game['question_base_text']}\n\n"
-        f"👥 Javob berganlar ({len(game['answer_order'])}/{len(game['joined'])}):\n{answered_list}"
-    )
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=game["question_message_id"],
-            text=live_text,
+            text=build_live_text(game),
             reply_markup=build_keyboard(qid, "g"),
         )
     except Exception:
@@ -504,7 +601,20 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         current_idx = game["idx"]
         for job in context.job_queue.get_jobs_by_name(f"timeout_{chat_id}_{current_idx}"):
             job.schedule_removal()
+        for job in context.job_queue.get_jobs_by_name(f"countdown_{chat_id}_{current_idx}"):
+            job.schedule_removal()
         await finalize_question(chat_id, current_idx, context)
+
+
+async def handle_showvotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, chat_id_str, idx_str = query.data.split(":")
+    detail = question_history.get((int(chat_id_str), int(idx_str)))
+    if not detail:
+        await query.answer("Ma'lumot topilmadi.", show_alert=True)
+        return
+    await context.bot.send_message(chat_id=query.message.chat_id, text=f"👁 Ovozlar:\n{detail}")
+    await query.answer()
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -529,6 +639,8 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join:"))
     app.add_handler(CallbackQueryHandler(handle_gostart, pattern=r"^gostart:"))
+    app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
+    app.add_handler(CallbackQueryHandler(handle_showvotes, pattern=r"^showvotes:"))
     app.add_handler(CallbackQueryHandler(solo_handle_answer, pattern=r"^solo:"))
     app.add_handler(CallbackQueryHandler(handle_group_answer, pattern=r"^g:"))
 
