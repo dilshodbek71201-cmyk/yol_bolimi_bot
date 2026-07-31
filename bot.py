@@ -613,7 +613,11 @@ async def handle_showvotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not detail:
         await query.answer("Ma'lumot topilmadi.", show_alert=True)
         return
-    await context.bot.send_message(chat_id=query.message.chat_id, text=f"👁 Ovozlar:\n{detail}")
+    new_text = f"{query.message.text}\n\n👁 Ovozlar:\n{detail}"
+    try:
+        await query.edit_message_text(new_text)
+    except Exception:
+        pass
     await query.answer()
 
 
