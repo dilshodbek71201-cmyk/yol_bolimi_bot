@@ -364,8 +364,8 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
     )
     context.job_queue.run_repeating(
         countdown_tick,
-        interval=1,
-        first=1,
+        interval=3,
+        first=3,
         chat_id=chat_id,
         data={"idx": game["idx"]},
         name=f"countdown_{chat_id}_{game['idx']}",
@@ -394,7 +394,7 @@ async def countdown_tick(context: ContextTypes.DEFAULT_TYPE):
         job.schedule_removal()
         return
 
-    game["seconds_left"] = max(0, game["seconds_left"] - 1)
+    game["seconds_left"] = max(0, game["seconds_left"] - 3)
 
     qid = game["order"][idx]
     try:
