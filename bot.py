@@ -30,6 +30,7 @@ import os
 import random
 import logging
 import asyncio
+import time
 
 try:
     asyncio.get_event_loop()
@@ -38,6 +39,7 @@ except RuntimeError:
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -69,6 +71,31 @@ QUESTIONS_PER_GAME = 25
 QUESTION_TIME_SECONDS = 30
 
 TITLES = {1: "🥇 Kuchli prorab", 2: "🥈 Yaxshi prorab", 3: "🥉 Prorab"}
+
+EDIT_MIN_INTERVAL = 2.5  # bitta xabarni bundan tezroq qayta tahrirlamaymiz (flood control)
+
+
+async def safe_send(bot, chat_id, text, **kwargs):
+    """Flood control bo'lsa kutib, qayta urinib ko'radi - bot hech qachon to'xtab qolmaydi."""
+    for attempt in range(3):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            return None
+    return None
+
+
+async def safe_edit(bot, chat_id, message_id, text, **kwargs):
+    try:
+        return await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text, **kwargs
+        )
+    except RetryAfter:
+        return None  # tahrirlashni o'tkazib yuboramiz, keyingi tiklashda ko'rinadi
+    except Exception:
+        return None
 
 # Telegram'ning tayyor (bepul) animatsion effektlari - FAQAT shaxsiy chatlarda ishlaydi
 EFFECT_CONFETTI = "5046509860389126442"  # 🎉 to'g'ri javob uchun
@@ -297,6 +324,7 @@ def new_game_state():
         "first_correct": None,  # birinchi to'g'ri javob topgan ism
         "choices_this_q": {},  # letter -> [ismlar]
         "no_answer_streak": 0,  # ketma-ket hech kim javob bermagan savollar soni
+        "last_edit_ts": 0,  # flood control uchun oxirgi tahrirlash vaqti
     }
 
 
@@ -359,12 +387,11 @@ async def handle_gostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["order"] = pick_questions(QUESTIONS_PER_GAME)
     game["idx"] = 0
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"🚀 Musobaqa boshlandi! {len(game['order'])} ta savol, omad!\n"
-            f"Istalgan vaqtda variant tanlab, o'yinga qo'shilishingiz mumkin."
-        ),
+    await safe_send(
+        context.bot,
+        chat_id,
+        f"🚀 Musobaqa boshlandi! {len(game['order'])} ta savol, omad!\n"
+        f"Istalgan vaqtda variant tanlab, o'yinga qo'shilishingiz mumkin.",
     )
     await group_send_question(chat_id, context)
 
@@ -384,9 +411,9 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
     )
     game["question_stem_text"] = stem_text
     kb = build_keyboard(qid, "g")
-    msg = await context.bot.send_message(
-        chat_id=chat_id, text=build_live_text(game), reply_markup=kb
-    )
+    msg = await safe_send(context.bot, chat_id, build_live_text(game), reply_markup=kb)
+    if msg is None:
+        return
     game["question_message_id"] = msg.message_id
 
     context.job_queue.run_once(
@@ -431,15 +458,16 @@ async def countdown_tick(context: ContextTypes.DEFAULT_TYPE):
     game["seconds_left"] = max(0, game["seconds_left"] - 3)
 
     qid = game["order"][idx]
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=game["question_message_id"],
-            text=build_live_text(game),
+    now = time.time()
+    if now - game.get("last_edit_ts", 0) >= EDIT_MIN_INTERVAL:
+        game["last_edit_ts"] = now
+        await safe_edit(
+            context.bot,
+            chat_id,
+            game["question_message_id"],
+            build_live_text(game),
             reply_markup=build_keyboard(qid, "g"),
         )
-    except Exception:
-        pass
 
     if game["seconds_left"] <= 0:
         job.schedule_removal()
@@ -499,7 +527,7 @@ async def finalize_question(chat_id, idx, context: ContextTypes.DEFAULT_TYPE):
     else:
         game["no_answer_streak"] = 0
 
-    await context.bot.send_message(chat_id=chat_id, text=reveal)
+    await safe_send(context.bot, chat_id, reveal)
 
     game["idx"] += 1
 
@@ -512,9 +540,10 @@ async def finalize_question(chat_id, idx, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("▶️ Testni davom ettirish", callback_data=f"resume:{chat_id}")]]
         )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏸ Ketma-ket 2 ta savolga hech kim javob bermadi. Test pauza qilindi.",
+        await safe_send(
+            context.bot,
+            chat_id,
+            "⏸ Ketma-ket 2 ta savolga hech kim javob bermadi. Test pauza qilindi.",
             reply_markup=kb,
         )
         return
@@ -570,7 +599,7 @@ async def finish_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
     lines.append("\nShaxsiy tahlilingizni ko'rish uchun botga shaxsiy chatda /tahlil yozing.")
     lines.append("Yangi musobaqa uchun /start ni qayta bosing.")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    await safe_send(context.bot, chat_id, "\n".join(lines))
     del games[chat_id]
 
 
@@ -613,16 +642,17 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     game["answer_order"].append(name)
     game["choices_this_q"].setdefault(chosen, []).append(name)
 
-    # savol xabarini "javob berganlar" ro'yxati bilan jonli yangilaymiz
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=game["question_message_id"],
-            text=build_live_text(game),
+    # savol xabarini "javob berganlar" ro'yxati bilan jonli yangilaymiz (tez-tez bo'lsa - o'tkazib yuboramiz)
+    now = time.time()
+    if now - game.get("last_edit_ts", 0) >= EDIT_MIN_INTERVAL:
+        game["last_edit_ts"] = now
+        await safe_edit(
+            context.bot,
+            chat_id,
+            game["question_message_id"],
+            build_live_text(game),
             reply_markup=build_keyboard(qid, "g"),
         )
-    except Exception:
-        pass  # xabar o'zgarmagan yoki savol allaqachon yopilgan bo'lishi mumkin
 
     # agar barcha qatnashchilar javob bergan bo'lsa, vaqtdan oldin yakunlaymiz
     if len(game["answered_this_q"]) >= len(game["joined"]):
