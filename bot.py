@@ -465,13 +465,7 @@ async def finalize_question(chat_id, idx, context: ContextTypes.DEFAULT_TYPE):
     else:
         game["no_answer_streak"] = 0
 
-    scoreboard = build_scoreboard(game)
-    votes_kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("👁 Ovozlarni ko'rish", callback_data=f"showvotes:{chat_id}:{idx}")]]
-    )
-    await context.bot.send_message(
-        chat_id=chat_id, text=f"{reveal}\n\n{scoreboard}", reply_markup=votes_kb
-    )
+    await context.bot.send_message(chat_id=chat_id, text=reveal)
 
     game["idx"] += 1
 
@@ -644,7 +638,6 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join:"))
     app.add_handler(CallbackQueryHandler(handle_gostart, pattern=r"^gostart:"))
     app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
-    app.add_handler(CallbackQueryHandler(handle_showvotes, pattern=r"^showvotes:"))
     app.add_handler(CallbackQueryHandler(solo_handle_answer, pattern=r"^solo:"))
     app.add_handler(CallbackQueryHandler(handle_group_answer, pattern=r"^g:"))
 
