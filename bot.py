@@ -31,6 +31,7 @@ import random
 import logging
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone, time as dtime
 
 try:
     asyncio.get_event_loop()
@@ -55,6 +56,8 @@ QUESTIONS_PATH = os.path.join(BASE_DIR, "questions.json")
 ANSWERS_PATH = os.path.join(BASE_DIR, "answers.json")
 STATS_DIR = os.environ.get("STATS_DIR", BASE_DIR)
 STATS_PATH = os.path.join(STATS_DIR, "user_stats.json")
+CHATS_PATH = os.path.join(STATS_DIR, "registered_chats.json")
+QCOUNT_PATH = os.path.join(STATS_DIR, "question_count.json")
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -254,6 +257,88 @@ def save_stats(stats):
 
 USER_STATS = load_stats()
 
+TASHKENT_TZ = timezone(timedelta(hours=5))
+ATTESTATION_DT = datetime(2026, 8, 10, 9, 0, tzinfo=TASHKENT_TZ)
+
+
+def load_json_safe(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
+
+
+def save_json_safe(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+REGISTERED_CHATS = set(load_json_safe(CHATS_PATH, []))
+
+
+def register_chat(chat_id: int):
+    if chat_id not in REGISTERED_CHATS:
+        REGISTERED_CHATS.add(chat_id)
+        save_json_safe(CHATS_PATH, list(REGISTERED_CHATS))
+
+
+def format_countdown(target: datetime) -> str:
+    now = datetime.now(TASHKENT_TZ)
+    delta = target - now
+    note = (
+        "\n\n💡 Bilim — kuch, tayyorgarlik — g'alaba kaliti!\n"
+        "❗️Agar qaysidir savolda xatolik bor deb hisoblasangiz, "
+        "Adminga @D_Saidxojayev savol raqamini yozing va o'zingizning "
+        "to'g'ri deb bilgan javobingizni yuboring — birgalikda testni "
+        "yanada mukammal qilamiz! 🙌"
+    )
+    if delta.total_seconds() <= 0:
+        return "⏰ Attestatsiya sanasi allaqachon boshlangan yoki o'tib ketgan." + note
+    days = delta.days
+    hours = delta.seconds // 3600
+    minutes = (delta.seconds % 3600) // 60
+    return (
+        f"🎯 Attestatsiyaga sanoq boshlandi!\n\n"
+        f"📅 Qoldi: {days} kun, {hours} soat, {minutes} daqiqa\n"
+        f"🗓 Sana: {target.strftime('%d.%m.%Y')}, soat {target.strftime('%H:%M')}\n\n"
+        f"💪 Har bir daqiqa muhim — mashq qilishda davom eting!"
+        f"{note}"
+    )
+
+
+async def qolgan_vaqt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        register_chat(update.effective_chat.id)
+    await update.message.reply_text(format_countdown(ATTESTATION_DT))
+
+
+async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    text = format_countdown(ATTESTATION_DT)
+    for chat_id in list(REGISTERED_CHATS):
+        await safe_send(context.bot, chat_id, text)
+
+
+async def check_new_questions(context: ContextTypes.DEFAULT_TYPE):
+    prev = load_json_safe(QCOUNT_PATH, {}).get("count", 0)
+    current = len(QUESTIONS)
+    if current > prev:
+        diff = current - prev
+        text = (
+            f"📢 E'tibor bering! {diff} ta yangi savol qo'shildi.\n"
+            f"Hozir jami {current} ta savol mavjud."
+        )
+        for chat_id in list(REGISTERED_CHATS):
+            await safe_send(context.bot, chat_id, text)
+    save_json_safe(QCOUNT_PATH, {"count": current})
+
+
+
 
 def record_result(user_id: int, name: str, percent: int):
     key = str(user_id)
@@ -356,6 +441,7 @@ async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = chat.id
+    register_chat(chat_id)
     if chat_id in games and games[chat_id]["phase"] == "running":
         await update.message.reply_text("Hozir musobaqa davom etmoqda, kuting.")
         return
@@ -718,12 +804,18 @@ def main():
     app.add_handler(CommandHandler("musobaqa", musobaqa_start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("tahlil", tahlil))
+    app.add_handler(CommandHandler("qolgan_vaqt", qolgan_vaqt))
 
     app.add_handler(CallbackQueryHandler(handle_gostart, pattern=r"^gostart:"))
     app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(solo_handle_answer, pattern=r"^solo:"))
     app.add_handler(CallbackQueryHandler(handle_group_answer, pattern=r"^g:"))
     app.add_error_handler(global_error_handler)
+
+    # har 3 soatda eslatma yuboriladi
+    app.job_queue.run_repeating(daily_reminder, interval=3 * 3600, first=10)
+    # bot ishga tushganda, savollar soni oshgan bo'lsa xabar beriladi
+    app.job_queue.run_once(check_new_questions, when=5)
 
     print("Bot ishga tushdi...")
     app.run_polling()
