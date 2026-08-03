@@ -31,6 +31,7 @@ import random
 import logging
 import asyncio
 import time
+import re
 from datetime import datetime, timedelta, timezone, time as dtime
 
 try:
@@ -45,6 +46,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
 )
 
@@ -57,6 +61,10 @@ ANSWERS_PATH = os.path.join(BASE_DIR, "answers.json")
 STATS_DIR = os.environ.get("STATS_DIR", BASE_DIR)
 STATS_PATH = os.path.join(STATS_DIR, "user_stats.json")
 CHATS_PATH = os.path.join(STATS_DIR, "registered_chats.json")
+APPROVED_PATH = os.path.join(STATS_DIR, "approved_users.json")
+APPROVED_CHATS_PATH = os.path.join(STATS_DIR, "approved_chats.json")
+ADMIN_ID_PATH = os.path.join(STATS_DIR, "admin_id.json")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "D_Saidxojayev").lstrip("@").lower()
 QCOUNT_PATH = os.path.join(STATS_DIR, "question_count.json")
 QSTATS_PATH = os.path.join(STATS_DIR, "question_stats.json")
 DAILY_PATH = os.path.join(STATS_DIR, "daily_stats.json")
@@ -167,7 +175,56 @@ async def solo_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE, user_i
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 
+ADMIN_MENU_LABELS = [
+    "📋 Admin hisobot",
+    "👥 Ro'yxat",
+    "🏆 Reyting",
+    "😖 Qiyin savollar",
+    "📊 Kunlik hisobot",
+    "📅 Qolgan vaqt",
+    "📝 Testni boshlash",
+]
+
+
+def build_admin_menu():
+    from telegram import ReplyKeyboardMarkup
+
+    rows = [
+        ["📋 Admin hisobot", "👥 Ro'yxat"],
+        ["🏆 Reyting", "😖 Qiyin savollar"],
+        ["📊 Kunlik hisobot", "📅 Qolgan vaqt"],
+        ["📝 Testni boshlash"],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 async def solo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_approved(user):
+        if user.id in REG_STATE:
+            step = REG_STATE[user.id]["step"]
+            await update.message.reply_text(REG_QUESTIONS[step])
+            return
+        if user.id in PENDING_REQUESTS:
+            await update.message.reply_text(
+                "So'rovingiz allaqachon adminga yuborilgan, javobini kuting."
+            )
+            return
+        await simple_access_request(user, update, context)
+        return
+
+    if is_admin(user):
+        remember_admin_id(user)
+        await update.message.reply_text(
+            "👋 Xush kelibsiz, admin! Quyidagi tugmalardan foydalaning:",
+            reply_markup=build_admin_menu(),
+        )
+        return
+
+    await start_solo_quiz(update, context)
+
+
+async def start_solo_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     order = list(QUESTIONS.keys())
     random.shuffle(order)
@@ -290,6 +347,169 @@ def save_json_safe(path, data):
 
 
 REGISTERED_CHATS = set(load_json_safe(CHATS_PATH, []))
+APPROVED_USERS = set(load_json_safe(APPROVED_PATH, []))
+PENDING_REQUESTS = set()  # xotirada - qayta so'rov yubormaslik uchun
+REG_STATE = {}  # user_id -> {"step": 1/2/3, "fio":..., "dm":..., "lavozim":...}
+
+REG_QUESTIONS = {
+    1: "1️⃣ Familiya va ismingizni to'liq yozing:",
+    2: "2️⃣ Qaysi DM (yo'l bo'limi/tashkilot)da ishlaysiz?",
+    3: "3️⃣ Lavozimingiz nima?",
+}
+
+
+
+
+async def handle_registration_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in REG_STATE:
+        return  # bu odam so'rovnomada emas - e'tibor bermaymiz
+    state = REG_STATE[user.id]
+    text = update.message.text.strip()
+
+    if state["step"] == 1:
+        state["fio"] = text
+        state["step"] = 2
+        await update.message.reply_text(REG_QUESTIONS[2])
+    elif state["step"] == 2:
+        state["dm"] = text
+        state["step"] = 3
+        await update.message.reply_text(REG_QUESTIONS[3])
+    elif state["step"] == 3:
+        state["lavozim"] = text
+        del REG_STATE[user.id]
+        PENDING_REQUESTS.add(user.id)
+        QUESTIONNAIRE_DONE.add(user.id)
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Ruxsat berish", callback_data=f"approve:{user.id}"),
+                    InlineKeyboardButton("❌ Rad etish", callback_data=f"deny:{user.id}"),
+                ]
+            ]
+        )
+        admin_text = (
+            f"{state['fio']}\n"
+            f"{state['dm']}\n"
+            f"{state['lavozim']}\n\n"
+            f"Sizdan botdan foydalanish uchun so'rovnomadan o'tib, "
+            f"testni yechish uchun ruxsat so'ramoqda."
+        )
+        if ADMIN_ID:
+            await safe_send(context.bot, ADMIN_ID, admin_text, reply_markup=kb)
+        else:
+            await safe_send(context.bot, update.effective_chat.id, admin_text, reply_markup=kb)
+
+        await update.message.reply_text(
+            "✅ So'rovnomangiz qabul qilindi. Admin javobini kuting."
+        )
+
+
+
+def is_admin(user) -> bool:
+    return bool(user.username) and user.username.lower() == ADMIN_USERNAME
+
+
+APPROVED_CHATS = set(load_json_safe(APPROVED_CHATS_PATH, []))
+_admin_id_data = load_json_safe(ADMIN_ID_PATH, {})
+ADMIN_ID = _admin_id_data.get("id")
+PENDING_CHAT_REQUESTS = set()
+
+
+def remember_admin_id(user):
+    global ADMIN_ID
+    if is_admin(user) and ADMIN_ID != user.id:
+        ADMIN_ID = user.id
+        save_json_safe(ADMIN_ID_PATH, {"id": user.id})
+
+
+def is_chat_approved(chat_id: int) -> bool:
+    return chat_id in APPROVED_CHATS
+
+
+def approve_chat(chat_id: int):
+    APPROVED_CHATS.add(chat_id)
+    save_json_safe(APPROVED_CHATS_PATH, list(APPROVED_CHATS))
+    PENDING_CHAT_REQUESTS.discard(chat_id)
+
+
+async def request_chat_access(chat_id: int, chat_title: str, context: ContextTypes.DEFAULT_TYPE):
+    if chat_id in PENDING_CHAT_REQUESTS:
+        return
+    PENDING_CHAT_REQUESTS.add(chat_id)
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Ruxsat berish", callback_data=f"approvechat:{chat_id}"),
+                InlineKeyboardButton("❌ Rad etish", callback_data=f"denychat:{chat_id}"),
+            ]
+        ]
+    )
+    text = f'🔔 Bot yangi guruhga qo\'shildi: "{chat_title}" (id: {chat_id}).\nBu guruhda ishlashiga ruxsat berasizmi?'
+    if ADMIN_ID:
+        await safe_send(context.bot, ADMIN_ID, text, reply_markup=kb)
+    else:
+        # admin ID hali noma'lum - guruhning o'ziga so'rov chiqaramiz, admin shu yerda ko'radi
+        await safe_send(context.bot, chat_id, text, reply_markup=kb)
+
+
+async def handle_bot_added_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = update.my_chat_member
+    if not result:
+        return
+    new_status = result.new_chat_member.status
+    old_status = result.old_chat_member.status
+    if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
+        chat = result.chat
+        if not is_chat_approved(chat.id):
+            await request_chat_access(chat.id, chat.title or str(chat.id), context)
+
+
+
+def is_approved(user) -> bool:
+    return is_admin(user) or user.id in APPROVED_USERS
+
+
+def approve_user(user_id: int):
+    APPROVED_USERS.add(user_id)
+    save_json_safe(APPROVED_PATH, list(APPROVED_USERS))
+    PENDING_REQUESTS.discard(user_id)
+
+
+QUESTIONNAIRE_DONE = set()  # kimlar batafsil so'rovnomadan allaqachon o'tgan
+
+
+async def simple_access_request(user, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    PENDING_REQUESTS.add(user.id)
+    name = display_name(user)
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Ruxsat berish", callback_data=f"approve:{user.id}"),
+                InlineKeyboardButton("❌ Rad etish", callback_data=f"deny:{user.id}"),
+            ]
+        ]
+    )
+    text = f"🔔 Yangi so'rov: {name} (id: {user.id}) botdan foydalanishga ruxsat so'ramoqda."
+    if ADMIN_ID:
+        await safe_send(context.bot, ADMIN_ID, text, reply_markup=kb)
+    else:
+        await safe_send(context.bot, update.effective_chat.id, text, reply_markup=kb)
+    await update.message.reply_text(
+        "🔒 Botdan foydalanish uchun admin ruxsati kerak. So'rovingiz yuborildi, kuting..."
+    )
+
+
+async def start_questionnaire_for(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    REG_STATE[user_id] = {"step": 1}
+    await safe_send(
+        context.bot, user_id,
+        "Sizning so'rovingiz rad etildi. Iltimos, qo'shimcha ma'lumot bilan qayta so'rov yuboring:\n\n"
+        + REG_QUESTIONS[1],
+    )
+
+
 QUESTION_STATS = load_json_safe(QSTATS_PATH, {})  # qid -> {"correct":n, "wrong":n}
 DAILY_STATS = load_json_safe(DAILY_PATH, {})  # "YYYY-MM-DD" -> {"games":n, "participants":[...], "percents":[...]}
 
@@ -510,6 +730,63 @@ def build_analysis_text(user_id: int) -> str:
     return "\n".join(lines)
 
 
+def build_all_users_text() -> str:
+    if not USER_STATS:
+        return "Hali hech kim botdan foydalanmagan."
+    rows = []
+    for uid, entry in USER_STATS.items():
+        name = entry.get("name", uid)
+        games_count = len(entry.get("history", []))
+        rows.append((name, games_count))
+    rows.sort(key=lambda x: x[0].lower())
+    lines = [f"👥 Botdan foydalangan barcha odamlar ({len(rows)} kishi):\n"]
+    for name, games_count in rows:
+        lines.append(f"• {name} — {games_count} marta musobaqada qatnashgan")
+    return "\n".join(lines)
+
+
+def level_label(avg: float) -> str:
+    if avg >= 85:
+        return "🟢 Yuqori"
+    if avg >= 60:
+        return "🟡 O'rta"
+    return "🔴 Past"
+
+
+def build_admin_report_text() -> str:
+    lines = ["📋 ADMIN HISOBOTI\n"]
+
+    lines.append(f"👥 Ro'yxatdan o'tgan (ruxsatli) shaxslar: {len(APPROVED_USERS)} kishi")
+    lines.append(f"🏘 Ruxsatli guruhlar: {len(APPROVED_CHATS)} ta")
+    lines.append(f"⏳ Javob kutilayotgan so'rovlar: {len(PENDING_REQUESTS)} ta\n")
+
+    if not USER_STATS:
+        lines.append("Hali hech kim musobaqada qatnashmagan.")
+        return "\n".join(lines)
+
+    rows = []
+    for uid, entry in USER_STATS.items():
+        name = entry.get("name", uid)
+        history = entry.get("history", [])
+        games_count = len(history)
+        avg = round(sum(history) / games_count) if games_count else 0
+        rows.append((name, games_count, avg))
+
+    rows.sort(key=lambda x: x[2], reverse=True)
+
+    lines.append("📊 Har bir shaxsning test yechish darajasi:\n")
+    for name, games_count, avg in rows:
+        if games_count == 0:
+            lines.append(f"• {name} — hali musobaqada qatnashmagan")
+        else:
+            lines.append(
+                f"• {name} — {level_label(avg)} ({avg}%), {games_count} marta qatnashgan"
+            )
+
+    return "\n".join(lines)
+
+
+
 async def tahlil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = build_analysis_text(update.effective_user.id)
     await update.message.reply_text(text)
@@ -525,6 +802,20 @@ async def reyting(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_daily_report_text())
+
+
+async def royxat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_all_users_text())
+
+
+async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user):
+        return  # boshqa hech kimga javob berilmaydi, buyruq borligi ham bilinmaydi
+    remember_admin_id(user)
+    await safe_send(context.bot, user.id, build_admin_report_text())
+    if update.effective_chat.id != user.id:
+        await update.message.reply_text("📋 Hisobot sizning shaxsiy chatingizga yuborildi.")
 
 
 
@@ -569,12 +860,21 @@ def display_name(user) -> str:
 
 
 async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_admin_id(update.effective_user)
     chat = update.effective_chat
     if chat.type == ChatType.PRIVATE:
         await solo_start(update, context)
         return
 
     chat_id = chat.id
+
+    if not is_chat_approved(chat_id):
+        await update.message.reply_text(
+            "🔒 Bu guruhda ishlash uchun admin ruxsati kutilmoqda."
+        )
+        await request_chat_access(chat_id, chat.title or str(chat_id), context)
+        return
+
     register_chat(chat_id)
     if chat_id in games and games[chat_id]["phase"] == "running":
         await update.message.reply_text("Hozir musobaqa davom etmoqda, kuting.")
@@ -593,6 +893,76 @@ async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"variantni tanlashning o'zi yetarli.",
         reply_markup=kb,
     )
+
+
+async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action, uid_str = query.data.split(":")
+    target_id = int(uid_str)
+
+    if not is_admin(query.from_user):
+        await safe_answer(query, "Faqat admin bu tugmani bosishi mumkin.", show_alert=True)
+        return
+
+    if action == "approve":
+        approve_user(target_id)
+        await safe_answer(query, "Ruxsat berildi.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await safe_send(
+            context.bot, query.message.chat_id,
+            f"✅ Admin ruxsat berdi! Endi /start bilan botdan foydalanishingiz mumkin."
+        )
+        await safe_send(
+            context.bot, target_id,
+            "✅ Admin sizga ruxsat berdi! Endi /start bilan botdan foydalanishingiz mumkin."
+        )
+    else:
+        PENDING_REQUESTS.discard(target_id)
+        await safe_answer(query, "Rad etildi.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        if target_id not in QUESTIONNAIRE_DONE:
+            await start_questionnaire_for(target_id, context)
+        else:
+            await safe_send(
+                context.bot, target_id,
+                "❌ So'rovingiz rad etildi."
+            )
+
+
+async def handle_chat_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action, cid_str = query.data.split(":")
+    target_chat_id = int(cid_str)
+
+    if not is_admin(query.from_user):
+        await safe_answer(query, "Faqat admin bu tugmani bosishi mumkin.", show_alert=True)
+        return
+
+    if action == "approvechat":
+        approve_chat(target_chat_id)
+        await safe_answer(query, "Guruhga ruxsat berildi.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await safe_send(
+            context.bot, target_chat_id,
+            "✅ Admin ushbu guruhga ruxsat berdi! Endi /start bilan musobaqa boshlashingiz mumkin."
+        )
+    else:
+        PENDING_CHAT_REQUESTS.discard(target_chat_id)
+        await safe_answer(query, "Rad etildi.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
 
 async def handle_gostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -878,6 +1248,14 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user = query.from_user
+    if not is_approved(user) and not is_chat_approved(chat_id):
+        await safe_answer(
+            query,
+            "🔒 Botdan foydalanish uchun admin ruxsati kerak. Botga shaxsiy /start yozib so'rov yuboring.",
+            show_alert=True,
+        )
+        return
+
     if user.id not in game["joined"]:
         game["joined"][user.id] = display_name(user)
         game["scores"].setdefault(user.id, 0)
@@ -968,6 +1346,22 @@ async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ushlanmagan xatolik:", exc_info=context.error)
 
 
+async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    routes = {
+        "📋 Admin hisobot": admin_report,
+        "👥 Ro'yxat": royxat,
+        "🏆 Reyting": reyting,
+        "😖 Qiyin savollar": qiyin_savollar,
+        "📊 Kunlik hisobot": hisobot,
+        "📅 Qolgan vaqt": qolgan_vaqt,
+        "📝 Testni boshlash": start_solo_quiz,
+    }
+    func = routes.get(text)
+    if func:
+        await func(update, context)
+
+
 def main():
     if not TOKEN:
         print("XATOLIK: BOT_TOKEN muhit o'zgaruvchisi topilmadi.")
@@ -982,8 +1376,16 @@ def main():
     app.add_handler(CommandHandler("qiyin_savollar", qiyin_savollar))
     app.add_handler(CommandHandler("reyting", reyting))
     app.add_handler(CommandHandler("hisobot", hisobot))
+    app.add_handler(CommandHandler("royxat", royxat))
+    app.add_handler(CommandHandler("admin", admin_report))
 
     app.add_handler(CallbackQueryHandler(handle_gostart, pattern=r"^gostart:"))
+    app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|deny):"))
+    app.add_handler(CallbackQueryHandler(handle_chat_approval, pattern=r"^(approvechat|denychat):"))
+    app.add_handler(ChatMemberHandler(handle_bot_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
+    menu_labels_pattern = "^(" + "|".join(re.escape(l) for l in ADMIN_MENU_LABELS) + ")$"
+    app.add_handler(MessageHandler(filters.Regex(menu_labels_pattern), handle_menu_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_registration_message))
     app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(solo_handle_answer, pattern=r"^solo:"))
     app.add_handler(CallbackQueryHandler(handle_group_answer, pattern=r"^g:"))
