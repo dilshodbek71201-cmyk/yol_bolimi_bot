@@ -58,6 +58,8 @@ STATS_DIR = os.environ.get("STATS_DIR", BASE_DIR)
 STATS_PATH = os.path.join(STATS_DIR, "user_stats.json")
 CHATS_PATH = os.path.join(STATS_DIR, "registered_chats.json")
 QCOUNT_PATH = os.path.join(STATS_DIR, "question_count.json")
+QSTATS_PATH = os.path.join(STATS_DIR, "question_stats.json")
+DAILY_PATH = os.path.join(STATS_DIR, "daily_stats.json")
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -280,6 +282,105 @@ def save_json_safe(path, data):
 
 
 REGISTERED_CHATS = set(load_json_safe(CHATS_PATH, []))
+QUESTION_STATS = load_json_safe(QSTATS_PATH, {})  # qid -> {"correct":n, "wrong":n}
+DAILY_STATS = load_json_safe(DAILY_PATH, {})  # "YYYY-MM-DD" -> {"games":n, "participants":[...], "percents":[...]}
+
+
+def record_answer_stat(qid: str, user_id: int, name: str, is_correct: bool):
+    qs = QUESTION_STATS.setdefault(qid, {"correct": 0, "wrong": 0})
+    qs["correct" if is_correct else "wrong"] += 1
+    save_json_safe(QSTATS_PATH, QUESTION_STATS)
+
+    key = str(user_id)
+    entry = USER_STATS.setdefault(key, {"name": name, "history": [], "wrong_counts": {}})
+    entry.setdefault("wrong_counts", {})
+    entry["name"] = name
+    if not is_correct:
+        entry["wrong_counts"][qid] = entry["wrong_counts"].get(qid, 0) + 1
+    save_stats(USER_STATS)
+
+
+def record_daily(percents: list, participant_ids: list):
+    today = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d")
+    day = DAILY_STATS.setdefault(today, {"games": 0, "participants": [], "percents": []})
+    day["games"] += 1
+    for uid in participant_ids:
+        if uid not in day["participants"]:
+            day["participants"].append(uid)
+    day["percents"].extend(percents)
+    save_json_safe(DAILY_PATH, DAILY_STATS)
+
+
+def build_hard_questions_text(top_n=10) -> str:
+    ranked = []
+    for qid, s in QUESTION_STATS.items():
+        total = s["correct"] + s["wrong"]
+        if total < 2:
+            continue
+        wrong_rate = s["wrong"] / total
+        ranked.append((qid, wrong_rate, s["wrong"], total))
+    if not ranked:
+        return "Hali yetarli statistika yo'q."
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    lines = ["😖 Eng qiyin savollar (ko'p xato qilinganlar):\n"]
+    for qid, rate, wrong, total in ranked[:top_n]:
+        qtext = QUESTIONS.get(qid, {}).get("q", "?")
+        short = qtext if len(qtext) <= 70 else qtext[:70] + "..."
+        lines.append(f"{qid}-savol ({round(rate*100)}% xato, {wrong}/{total}): {short}")
+    return "\n".join(lines)
+
+
+def build_leaderboard_text(top_n=10) -> str:
+    ranked = []
+    for uid, entry in USER_STATS.items():
+        history = entry.get("history", [])
+        if not history:
+            continue
+        avg = sum(history) / len(history)
+        ranked.append((entry.get("name", uid), avg, len(history)))
+    if not ranked:
+        return "Hali hech kim musobaqada qatnashmagan."
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    lines = ["🏆 Umumiy reyting (TOP-10, o'rtacha natija bo'yicha):\n"]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, (name, avg, n) in enumerate(ranked[:top_n], start=1):
+        prefix = medals.get(i, f"{i}.")
+        lines.append(f"{prefix} {name} — {round(avg)}% ({n} marta qatnashgan)")
+    return "\n".join(lines)
+
+
+def build_daily_report_text() -> str:
+    now = datetime.now(TASHKENT_TZ)
+    today = now.strftime("%Y-%m-%d")
+    week_ago = now - timedelta(days=7)
+
+    today_data = DAILY_STATS.get(today, {"games": 0, "participants": [], "percents": []})
+
+    week_games = 0
+    week_participants = set()
+    week_percents = []
+    for date_str, data in DAILY_STATS.items():
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if d.replace(tzinfo=TASHKENT_TZ) >= week_ago:
+            week_games += data["games"]
+            week_participants.update(data["participants"])
+            week_percents.extend(data["percents"])
+
+    today_avg = round(sum(today_data["percents"]) / len(today_data["percents"])) if today_data["percents"] else 0
+    week_avg = round(sum(week_percents) / len(week_percents)) if week_percents else 0
+
+    return (
+        f"📊 Statistika hisoboti\n\n"
+        f"📆 Bugun: {today_data['games']} ta musobaqa, "
+        f"{len(today_data['participants'])} kishi qatnashdi, o'rtacha natija {today_avg}%\n"
+        f"🗓 So'nggi 7 kun: {week_games} ta musobaqa, "
+        f"{len(week_participants)} kishi qatnashdi, o'rtacha natija {week_avg}%"
+    )
+
+
 
 
 def register_chat(chat_id: int):
@@ -342,7 +443,8 @@ async def check_new_questions(context: ContextTypes.DEFAULT_TYPE):
 
 def record_result(user_id: int, name: str, percent: int):
     key = str(user_id)
-    entry = USER_STATS.setdefault(key, {"name": name, "history": []})
+    entry = USER_STATS.setdefault(key, {"name": name, "history": [], "wrong_counts": {}})
+    entry.setdefault("wrong_counts", {})
     entry["name"] = name
     entry["history"].append(percent)
     save_stats(USER_STATS)
@@ -388,12 +490,33 @@ def build_analysis_text(user_id: int) -> str:
     else:
         lines.append("Tendensiyani ko'rish uchun yana kamida 1 marta qatnashing.")
 
+    wrong_counts = entry.get("wrong_counts", {})
+    if wrong_counts:
+        top_wrong = sorted(wrong_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        lines.append("\n📌 Siz eng ko'p xato qilgan savollaringiz:")
+        for qid, cnt in top_wrong:
+            qtext = QUESTIONS.get(qid, {}).get("q", "?")
+            short = qtext if len(qtext) <= 60 else qtext[:60] + "..."
+            lines.append(f"  • {qid}-savol ({cnt} marta xato): {short}")
+
     return "\n".join(lines)
 
 
 async def tahlil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = build_analysis_text(update.effective_user.id)
     await update.message.reply_text(text)
+
+
+async def qiyin_savollar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_hard_questions_text())
+
+
+async def reyting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_leaderboard_text())
+
+
+async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_daily_report_text())
 
 
 
@@ -413,6 +536,8 @@ def new_game_state():
         "choices_this_q": {},  # letter -> [ismlar]
         "no_answer_streak": 0,  # ketma-ket hech kim javob bermagan savollar soni
         "last_edit_ts": 0,  # flood control uchun oxirgi tahrirlash vaqti
+        "active_participants": set(),  # oxirgi savolda javob berganlar (keyingi kutish soni shunga asoslanadi)
+        "expected_count": 1,  # joriy savol uchun kutilayotgan javob soni
     }
 
 
@@ -493,6 +618,7 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
     game["first_correct"] = None
     game["choices_this_q"] = {}
     game["seconds_left"] = QUESTION_TIME_SECONDS
+    game["expected_count"] = len(game["active_participants"]) or len(game["joined"]) or 1
 
     qid = game["order"][game["idx"]]
     stem_text = build_question_text(
@@ -621,6 +747,7 @@ async def finalize_question(chat_id, idx, context: ContextTypes.DEFAULT_TYPE):
         game["no_answer_streak"] += 1
     else:
         game["no_answer_streak"] = 0
+        game["active_participants"] = set(game["answered_this_q"])
 
     await safe_send(context.bot, chat_id, reveal)
 
@@ -682,6 +809,7 @@ async def finish_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
     total_q = len(game["order"]) or 1
 
     lines = ["🏆 Musobaqa yakunlandi! Yakuniy natijalar:\n"]
+    percents = []
     for i, (uid, score) in enumerate(ranked, start=1):
         name = game["joined"].get(uid, str(uid))
         title = TITLES.get(i)
@@ -690,7 +818,10 @@ async def finish_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"{i}. {name} — {score} ball")
         percent = round(100 * score / total_q)
+        percents.append(percent)
         record_result(uid, name, percent)
+
+    record_daily(percents, list(game["scores"].keys()))
 
     lines.append("\nShaxsiy tahlilingizni ko'rish uchun botga shaxsiy chatda /tahlil yozing.")
     lines.append("Yangi musobaqa uchun /start ni qayta bosing.")
@@ -734,6 +865,9 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await query.answer("Qabul qilindi (javob kaliti hali yo'q).")
 
+    if correct_letter:
+        record_answer_stat(qid, user.id, name, is_correct)
+
     game["answer_order"].append(name)
     game["choices_this_q"].setdefault(chosen, []).append(name)
 
@@ -750,7 +884,7 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     # agar barcha qatnashchilar javob bergan bo'lsa, vaqtdan oldin yakunlaymiz
-    if len(game["answered_this_q"]) >= len(game["joined"]):
+    if len(game["answered_this_q"]) >= game.get("expected_count", len(game["joined"])):
         current_idx = game["idx"]
         for job in context.job_queue.get_jobs_by_name(f"timeout_{chat_id}_{current_idx}"):
             try:
@@ -805,6 +939,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("tahlil", tahlil))
     app.add_handler(CommandHandler("qolgan_vaqt", qolgan_vaqt))
+    app.add_handler(CommandHandler("qiyin_savollar", qiyin_savollar))
+    app.add_handler(CommandHandler("reyting", reyting))
+    app.add_handler(CommandHandler("hisobot", hisobot))
 
     app.add_handler(CallbackQueryHandler(handle_gostart, pattern=r"^gostart:"))
     app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
