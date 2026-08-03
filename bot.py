@@ -78,6 +78,7 @@ QUESTION_TIME_SECONDS = 30
 TITLES = {1: "🥇 Kuchli prorab", 2: "🥈 Yaxshi prorab", 3: "🥉 Prorab"}
 
 EDIT_MIN_INTERVAL = 2.5  # bitta xabarni bundan tezroq qayta tahrirlamaymiz (flood control)
+MIN_QUESTION_WAIT = 15  # savol hech bo'lmaganda shuncha soniya ochiq tursin
 
 
 async def safe_send(bot, chat_id, text, **kwargs):
@@ -101,6 +102,13 @@ async def safe_edit(bot, chat_id, message_id, text, **kwargs):
         return None  # tahrirlashni o'tkazib yuboramiz, keyingi tiklashda ko'rinadi
     except Exception:
         return None
+
+
+async def safe_answer(query, *args, **kwargs):
+    try:
+        return await query.answer(*args, **kwargs)
+    except Exception:
+        return None  # masalan, tugma muddati o'tgan bo'lishi mumkin - zarari yo'q
 
 # Telegram'ning tayyor (bepul) animatsion effektlari - FAQAT shaxsiy chatlarda ishlaydi
 EFFECT_CONFETTI = "5046509860389126442"  # 🎉 to'g'ri javob uchun
@@ -180,7 +188,7 @@ async def solo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def solo_handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     user_id = query.from_user.id
 
     if user_id not in solo_sessions:
@@ -538,6 +546,7 @@ def new_game_state():
         "last_edit_ts": 0,  # flood control uchun oxirgi tahrirlash vaqti
         "active_participants": set(),  # oxirgi savolda javob berganlar (keyingi kutish soni shunga asoslanadi)
         "expected_count": 1,  # joriy savol uchun kutilayotgan javob soni
+        "question_start_ts": 0,  # joriy savol qachon boshlanganini bilish uchun
     }
 
 
@@ -593,10 +602,10 @@ async def handle_gostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = games.get(chat_id)
 
     if not game or game["phase"] != "lobby":
-        await query.answer("Bu musobaqa allaqachon boshlangan yoki tugagan.", show_alert=True)
+        await safe_answer(query, "Bu musobaqa allaqachon boshlangan yoki tugagan.", show_alert=True)
         return
 
-    await query.answer("Boshlanmoqda!")
+    await safe_answer(query, "Boshlanmoqda!")
     game["phase"] = "running"
     game["order"] = pick_questions(QUESTIONS_PER_GAME)
     game["idx"] = 0
@@ -619,6 +628,7 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
     game["choices_this_q"] = {}
     game["seconds_left"] = QUESTION_TIME_SECONDS
     game["expected_count"] = len(game["active_participants"]) or len(game["joined"]) or 1
+    game["question_start_ts"] = time.time()
 
     qid = game["order"][game["idx"]]
     stem_text = build_question_text(
@@ -645,6 +655,13 @@ async def group_send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         data={"idx": game["idx"]},
         name=f"countdown_{chat_id}_{game['idx']}",
+    )
+    context.job_queue.run_once(
+        min_wait_check,
+        when=MIN_QUESTION_WAIT,
+        chat_id=chat_id,
+        data={"idx": game["idx"]},
+        name=f"minwait_{chat_id}_{game['idx']}",
     )
 
 
@@ -692,6 +709,27 @@ async def countdown_tick(context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
         except Exception:
             pass
+
+
+async def min_wait_check(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    idx = context.job.data["idx"]
+    game = games.get(chat_id)
+    if not game or game["idx"] != idx or game["question_closed"]:
+        return
+    expected = game.get("expected_count", len(game["joined"]))
+    if len(game["answered_this_q"]) >= expected:
+        for job in context.job_queue.get_jobs_by_name(f"timeout_{chat_id}_{idx}"):
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
+        for job in context.job_queue.get_jobs_by_name(f"countdown_{chat_id}_{idx}"):
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
+        await finalize_question(chat_id, idx, context)
 
 
 async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
@@ -780,10 +818,10 @@ async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = games.get(chat_id)
 
     if not game or game["phase"] != "paused":
-        await query.answer("Bu test hozir pauzada emas.", show_alert=True)
+        await safe_answer(query, "Bu test hozir pauzada emas.", show_alert=True)
         return
 
-    await query.answer("Davom etmoqda!")
+    await safe_answer(query, "Davom etmoqda!")
     game["phase"] = "running"
     game["no_answer_streak"] = 0
     try:
@@ -836,7 +874,7 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     game = games.get(chat_id)
 
     if not game or game["phase"] != "running":
-        await query.answer("Bu savol uchun musobaqa faol emas.")
+        await safe_answer(query, "Bu savol uchun musobaqa faol emas.")
         return
 
     user = query.from_user
@@ -845,7 +883,7 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         game["scores"].setdefault(user.id, 0)
 
     if user.id in game["answered_this_q"]:
-        await query.answer("Siz bu savolga allaqachon javob berdingiz.")
+        await safe_answer(query, "Siz bu savolga allaqachon javob berdingiz.")
         return
 
     game["answered_this_q"].add(user.id)
@@ -857,13 +895,13 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         game["scores"][user.id] = game["scores"].get(user.id, 0) + 1
         if game["first_correct"] is None:
             game["first_correct"] = name
-            await query.answer("✅ To'g'ri! Siz birinchi topdingiz 🥇")
+            await safe_answer(query, "✅ To'g'ri! Siz birinchi topdingiz 🥇")
         else:
-            await query.answer("✅ To'g'ri!")
+            await safe_answer(query, "✅ To'g'ri!")
     elif correct_letter:
-        await query.answer("❌ Noto'g'ri.")
+        await safe_answer(query, "❌ Noto'g'ri.")
     else:
-        await query.answer("Qabul qilindi (javob kaliti hali yo'q).")
+        await safe_answer(query, "Qabul qilindi (javob kaliti hali yo'q).")
 
     if correct_letter:
         record_answer_stat(qid, user.id, name, is_correct)
@@ -884,7 +922,9 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     # agar barcha qatnashchilar javob bergan bo'lsa, vaqtdan oldin yakunlaymiz
-    if len(game["answered_this_q"]) >= game.get("expected_count", len(game["joined"])):
+    elapsed = time.time() - game.get("question_start_ts", 0)
+    enough_answers = len(game["answered_this_q"]) >= game.get("expected_count", len(game["joined"]))
+    if enough_answers and elapsed >= MIN_QUESTION_WAIT:
         current_idx = game["idx"]
         for job in context.job_queue.get_jobs_by_name(f"timeout_{chat_id}_{current_idx}"):
             try:
@@ -904,14 +944,14 @@ async def handle_showvotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, chat_id_str, idx_str = query.data.split(":")
     detail = question_history.get((int(chat_id_str), int(idx_str)))
     if not detail:
-        await query.answer("Ma'lumot topilmadi.", show_alert=True)
+        await safe_answer(query, "Ma'lumot topilmadi.", show_alert=True)
         return
     new_text = f"{query.message.text}\n\n👁 Ovozlar:\n{detail}"
     try:
         await query.edit_message_text(new_text)
     except Exception:
         pass
-    await query.answer()
+    await safe_answer(query)
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
