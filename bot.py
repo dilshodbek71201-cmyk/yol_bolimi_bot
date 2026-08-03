@@ -218,7 +218,10 @@ async def solo_handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
     new_text = build_question_text(qid) + f"\n\nSiz tanladingiz: {chosen_text}" + result_line
-    await query.edit_message_text(new_text)
+    try:
+        await query.edit_message_text(new_text)
+    except Exception:
+        pass
 
     session["idx"] += 1
     await solo_send_question(query.message.chat_id, context, user_id)
@@ -452,7 +455,10 @@ async def countdown_tick(context: ContextTypes.DEFAULT_TYPE):
     game = games.get(chat_id)
 
     if not game or game["idx"] != idx or game["question_closed"]:
-        job.schedule_removal()
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
         return
 
     game["seconds_left"] = max(0, game["seconds_left"] - 3)
@@ -470,7 +476,10 @@ async def countdown_tick(context: ContextTypes.DEFAULT_TYPE):
         )
 
     if game["seconds_left"] <= 0:
-        job.schedule_removal()
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
 
 
 async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
@@ -658,9 +667,15 @@ async def handle_group_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     if len(game["answered_this_q"]) >= len(game["joined"]):
         current_idx = game["idx"]
         for job in context.job_queue.get_jobs_by_name(f"timeout_{chat_id}_{current_idx}"):
-            job.schedule_removal()
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
         for job in context.job_queue.get_jobs_by_name(f"countdown_{chat_id}_{current_idx}"):
-            job.schedule_removal()
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
         await finalize_question(chat_id, current_idx, context)
 
 
@@ -689,6 +704,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Ushlanmagan xatolik:", exc_info=context.error)
+
+
 def main():
     if not TOKEN:
         print("XATOLIK: BOT_TOKEN muhit o'zgaruvchisi topilmadi.")
@@ -704,6 +723,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_resume, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(solo_handle_answer, pattern=r"^solo:"))
     app.add_handler(CallbackQueryHandler(handle_group_answer, pattern=r"^g:"))
+    app.add_error_handler(global_error_handler)
 
     print("Bot ishga tushdi...")
     app.run_polling()
