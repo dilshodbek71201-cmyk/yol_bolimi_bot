@@ -118,6 +118,20 @@ async def safe_answer(query, *args, **kwargs):
     except Exception:
         return None  # masalan, tugma muddati o'tgan bo'lishi mumkin - zarari yo'q
 
+
+async def safe_reply(message, text, **kwargs):
+    """update.message.reply_text uchun - vaqtinchalik tarmoq xatosida qayta urinadi."""
+    for attempt in range(3):
+        try:
+            return await message.reply_text(text, **kwargs)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            if attempt == 2:
+                return None
+            await asyncio.sleep(1.5)
+    return None
+
 # Telegram'ning tayyor (bepul) animatsion effektlari - FAQAT shaxsiy chatlarda ishlaydi
 EFFECT_CONFETTI = "5046509860389126442"  # 🎉 to'g'ri javob uchun
 EFFECT_THUMBSDOWN = "5104858069142078462"  # 👎 xato javob uchun
@@ -215,7 +229,8 @@ async def solo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_admin(user):
         remember_admin_id(user)
-        await update.message.reply_text(
+        await safe_reply(
+            update.message,
             "👋 Xush kelibsiz, admin! Quyidagi tugmalardan foydalaning:",
             reply_markup=build_admin_menu(),
         )
