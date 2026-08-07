@@ -217,10 +217,10 @@ async def solo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_approved(user):
         if user.id in REG_STATE:
             step = REG_STATE[user.id]["step"]
-            await update.message.reply_text(REG_QUESTIONS[step])
+            await safe_reply(update.message, REG_QUESTIONS[step])
             return
         if user.id in PENDING_REQUESTS:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "So'rovingiz allaqachon adminga yuborilgan, javobini kuting."
             )
             return
@@ -250,7 +250,7 @@ async def start_solo_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "correct": 0,
         "unknown": 0,
     }
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         f"Assalomu alaykum! Jami {len(order)} ta savol bor.\n"
         f"Har safar tasodifiy tartibda so'rayman.\n"
         f"Boshlaymiz 👇"
@@ -385,11 +385,11 @@ async def handle_registration_message(update: Update, context: ContextTypes.DEFA
     if state["step"] == 1:
         state["fio"] = text
         state["step"] = 2
-        await update.message.reply_text(REG_QUESTIONS[2])
+        await safe_reply(update.message, REG_QUESTIONS[2])
     elif state["step"] == 2:
         state["dm"] = text
         state["step"] = 3
-        await update.message.reply_text(REG_QUESTIONS[3])
+        await safe_reply(update.message, REG_QUESTIONS[3])
     elif state["step"] == 3:
         state["lavozim"] = text
         del REG_STATE[user.id]
@@ -416,7 +416,7 @@ async def handle_registration_message(update: Update, context: ContextTypes.DEFA
         else:
             await safe_send(context.bot, update.effective_chat.id, admin_text, reply_markup=kb)
 
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "✅ So'rovnomangiz qabul qilindi. Admin javobini kuting."
         )
 
@@ -511,7 +511,7 @@ async def simple_access_request(user, update: Update, context: ContextTypes.DEFA
         await safe_send(context.bot, ADMIN_ID, text, reply_markup=kb)
     else:
         await safe_send(context.bot, update.effective_chat.id, text, reply_markup=kb)
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         "🔒 Botdan foydalanish uchun admin ruxsati kerak. So'rovingiz yuborildi, kuting..."
     )
 
@@ -659,7 +659,7 @@ def format_countdown(target: datetime) -> str:
 async def qolgan_vaqt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         register_chat(update.effective_chat.id)
-    await update.message.reply_text(format_countdown(ATTESTATION_DT))
+    await safe_reply(update.message, format_countdown(ATTESTATION_DT))
 
 
 async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -804,23 +804,23 @@ def build_admin_report_text() -> str:
 
 async def tahlil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = build_analysis_text(update.effective_user.id)
-    await update.message.reply_text(text)
+    await safe_reply(update.message, text)
 
 
 async def qiyin_savollar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_hard_questions_text())
+    await safe_reply(update.message, build_hard_questions_text())
 
 
 async def reyting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_leaderboard_text())
+    await safe_reply(update.message, build_leaderboard_text())
 
 
 async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_daily_report_text())
+    await safe_reply(update.message, build_daily_report_text())
 
 
 async def royxat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_all_users_text())
+    await safe_reply(update.message, build_all_users_text())
 
 
 async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -830,7 +830,7 @@ async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remember_admin_id(user)
     await safe_send(context.bot, user.id, build_admin_report_text())
     if update.effective_chat.id != user.id:
-        await update.message.reply_text("📋 Hisobot sizning shaxsiy chatingizga yuborildi.")
+        await safe_reply(update.message, "📋 Hisobot sizning shaxsiy chatingizga yuborildi.")
 
 
 
@@ -884,7 +884,7 @@ async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
 
     if not is_chat_approved(chat_id):
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "🔒 Bu guruhda ishlash uchun admin ruxsati kutilmoqda."
         )
         await request_chat_access(chat_id, chat.title or str(chat_id), context)
@@ -892,14 +892,14 @@ async def musobaqa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     register_chat(chat_id)
     if chat_id in games and games[chat_id]["phase"] == "running":
-        await update.message.reply_text("Hozir musobaqa davom etmoqda, kuting.")
+        await safe_reply(update.message, "Hozir musobaqa davom etmoqda, kuting.")
         return
 
     games[chat_id] = new_game_state()
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🎮 Boshlash", callback_data=f"gostart:{chat_id}")]]
     )
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         f"🏁 Attestatsiya musobaqasi!\n\n"
         f"Boshlash uchun \"Boshlash\" tugmasini bosing.\n"
         f"Har savolga {QUESTION_TIME_SECONDS} soniya vaqt beriladi, jami "
@@ -1349,7 +1349,7 @@ async def handle_showvotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     known = sum(1 for v in ANSWERS.values() if v)
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         f"Jami savollar: {len(QUESTIONS)}\n"
         f"Tasdiqlangan javob kaliti: {known} ta\n"
         f"Hali tasdiqlanmagan: {len(QUESTIONS) - known} ta\n\n"
